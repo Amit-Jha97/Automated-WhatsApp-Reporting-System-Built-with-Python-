@@ -1,0 +1,255 @@
+# Standard library imports
+import os
+import sys
+import time
+import shutil
+import urllib
+import threading
+from datetime import date, timedelta
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+# Third-party imports
+import pandas as pd
+import numpy as np
+import pyodbc
+from sqlalchemy import create_engine, text
+from tkcalendar import DateEntry
+import pywhatkit as kit
+import dataframe_image as dfi
+
+# --- Configuration ---
+if getattr(sys, 'frozen', False):
+    base_path = os.path.dirname(sys.executable)
+else:
+    base_path = os.path.dirname(os.path.abspath(__file__))
+
+asm_file_path = r"D:\Daily_Report\asm\asm.xlsx"
+
+# --- SQL Server connection details ---
+server_ip   = r'xxxx'
+database    = 'xxxx'
+table_name  = 'xxxxxxx'
+driver      = 'xxxxxxxxxxxxxxxxxxxxx'
+sql_username= 'xxx'
+sql_password= 'xxxxxxx'
+
+engine = None
+
+# --- Database Connection ---
+def get_db_engine():
+    global engine
+    if engine is not None:
+        return engine
+    try:
+        pyodbc_conn_str = (
+            f"DRIVER={driver};SERVER={server_ip};DATABASE={database};UID={sql_username};PWD={sql_password}"
+        )
+        conn_direct = pyodbc.connect(pyodbc_conn_str, timeout=5)
+        conn_direct.close()
+        params = urllib.parse.quote_plus(pyodbc_conn_str)
+        engine_conn_str = f"mssql+pyodbc:///?odbc_connect={params}"
+        engine = create_engine(engine_conn_str)
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        return engine
+    except Exception as e:
+        messagebox.showerror("Database Connection Error", f"❌ {e}")
+        return None
+
+# --- Excel (ASM) Data ---
+def get_asm_data():
+    try:
+        df = pd.read_excel(asm_file_path)
+        df.columns = df.columns.str.lower().str.strip()
+        df['code'] = df['code'].fillna('').astype(str).str.strip()
+        df['asmname'] = df['asmname'].fillna('').astype(str).str.strip().str.title()
+        df['head'] = df['head'].astype(str).str.strip().replace({'0':'','None':'','nan':''}).apply(lambda x: x.title() if x else '')
+        df['city'] = df['city'].astype(str).str.strip().replace({'0':'','None':'','nan':''}).apply(lambda x: x.title() if x else '')
+        if 'whatsapp_no' in df.columns:
+            df['whatsapp_no'] = df['whatsapp_no'].astype(str).str.strip().replace({'0':'','None':'','nan':''})
+        else:
+            df['whatsapp_no'] = ''
+        df_targets = df.drop_duplicates(subset=['asmname'])[['asmname','target dmt','target gtv','head','city','whatsapp_no']]
+        df_targets.rename(columns={'asmname':'ASM','target dmt':'Target_DMT','target gtv':'Target_GTV','head':'Head','city':'City'}, inplace=True)
+        df_codes = df[['code','asmname','city']].drop_duplicates(subset=['code'])
+        return df_targets, df_codes
+    except Exception as e:
+        messagebox.showerror("ASM Data Error", f"❌ {e}")
+        return pd.DataFrame(), pd.DataFrame()
+
+# --- SQL Data Fetching ---
+def get_sql_data(start_date, end_date, report_type="GTV"):
+    global engine
+    if engine is None:
+        engine = get_db_engine()
+        if engine is None: return pd.DataFrame()
+    try:
+        if report_type == "DMT":
+            query = text(f"SELECT code, amount, date, transaction_no FROM {table_name} "
+                         f"WHERE business_type='DMT' AND date >= :start AND date <= :end")
+        else:
+            query = text(f"SELECT code, amount, date, transaction_no FROM {table_name} "
+                         f"WHERE date >= :start AND date <= :end")
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params={'start': start_date, 'end': end_date})
+        df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
+        df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
+        df['code'] = df['code'].fillna('').astype(str).str.strip()
+        df['transaction_no'] = df['transaction_no'].fillna('').astype(str).str.strip()
+        return df
+    except Exception as e:
+        messagebox.showerror("DB Query Error", f"❌ {e}")
+        return pd.DataFrame()
+
+# --- Helpers ---
+def custom_count(amount): return int(round(amount/100000,0))
+
+def process_period_data(df_raw, asm_codes_df, label):
+    count_col = f'Count_{label}'
+    used_code_col = f'Used_Code_Count_{label}'
+    if asm_codes_df.empty: return pd.DataFrame(), pd.DataFrame()
+    grouped_db = df_raw.groupby('code').agg(db_amount=('amount','sum')).reset_index()
+    merged = pd.merge(asm_codes_df, grouped_db, on='code', how='left')
+    merged['db_amount'] = merged['db_amount'].fillna(0)
+    summary = merged.groupby('asmname',as_index=False)['db_amount'].sum()
+    summary.rename(columns={'asmname':'ASM','db_amount':'amount'}, inplace=True)
+    summary[count_col] = summary['amount'].apply(custom_count)
+    active_codes = df_raw[df_raw['amount']>0][['code']].drop_duplicates()
+    active_merged = pd.merge(asm_codes_df, active_codes, on='code', how='inner')
+    active_count = active_merged.groupby('asmname')['code'].nunique().reset_index()
+    active_count.rename(columns={'asmname':'ASM','code':used_code_col}, inplace=True)
+    return summary, active_count
+
+def prepare_report_df(df):
+    if df.empty: return pd.DataFrame(columns=df.columns)
+    df = df.copy()
+    for col in ['ACH%','LMTD %']: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+    for col in ['Target_GTV','Target_DMT']: 
+        if col in df.columns: df[col]=df[col].fillna(0)
+    for col in ['FTD','GTV MTD','GTV LMTD','DMT MTD','DMT LMTD','FTD ID','MTD ID','LMTD ID','Target_GTV','Target_DMT']:
+        if col in df.columns: df[col] = df[col].fillna(0).apply(lambda x:int(round(x)) if pd.notna(x) else 0)
+    return df
+
+def normalize_number(number):
+    number = str(number).strip()
+    if number.startswith('+') and number[1:].isdigit(): return number
+    elif number.startswith('91') and len(number)==12: return '+'+number
+    elif number.isdigit() and len(number)==10: return '+91'+number
+    else: return ''
+
+# --- Report Sending ---
+def send_report(report_df, head, number, single_date, image_folder, report_type="GTV"):
+    if report_df.empty: return
+    team_total = report_df[f'{report_type} MTD'].sum()
+    report_path = os.path.join(image_folder, f"{report_type}_Report_{head.replace(' ','_')}_{single_date.strftime('%Y-%m-%d')}.png")
+    temp_df = report_df.copy()
+    subtotal = pd.DataFrame([{
+        f'Target_{report_type}': temp_df[f'Target_{report_type}'].sum(),
+        f'{report_type} MTD': team_total,
+        f'{report_type} LMTD': temp_df[f'{report_type} LMTD'].sum(),
+        'FTD': temp_df['FTD'].sum(),
+        'ASM Name':'Subtotal','ACH%':0,'LMTD %':0,
+        'FTD ID':temp_df['FTD ID'].sum(),'MTD ID':temp_df['MTD ID'].sum(),'LMTD ID':temp_df['LMTD ID'].sum()
+    }])
+    if subtotal[f'Target_{report_type}'].iloc[0]>0:
+        subtotal['ACH%'] = (subtotal[f'{report_type} MTD']/subtotal[f'Target_{report_type}'])*100
+    if subtotal[f'{report_type} LMTD'].iloc[0]>0:
+        subtotal['LMTD %'] = (subtotal[f'{report_type} MTD']/subtotal[f'{report_type} LMTD'])*100
+    df_img = pd.concat([temp_df, subtotal], ignore_index=True).drop(columns=['Head','City'])
+    styled = (
+        df_img.style
+        .format({
+            f'Target_{report_type}':'{:,.0f}','FTD':'{:,.0f}',f'{report_type} MTD':'{:,.0f}',
+            f'{report_type} LMTD':'{:,.0f}','FTD ID':'{:,.0f}','MTD ID':'{:,.0f}',
+            'LMTD ID':'{:,.0f}','ACH%':'{:.0f}%','LMTD %':'{:.0f}%'
+        })
+        .hide(axis="index")
+        .set_properties(subset=['ASM Name'], **{'text-align':'left'})
+        .set_properties(subset=df_img.columns.difference(['ASM Name']), **{'text-align':'right'})
+        .set_table_styles([
+            {'selector':'tr:last-child','props':[('background-color','#7B3F00'),('color','white'),('font-weight','bold')]},
+            {'selector':'th','props':[('background-color','#7B3F00'),('color','white'),('font-weight','bold'),('text-align','center'),('border','1px solid black')]},
+            {'selector':'td','props':[('border','1px solid black')]},
+            {'selector':'caption','props':[('caption-side','top'),('text-align','center'),('font-size','16px'),('font-weight','bold'),('color','white'),
+                                           ('background-image','linear-gradient(to right, #00008B, #228B22, #FFD700)'),('padding','10px'),
+                                           ('border-top-left-radius','10px'),('border-top-right-radius','10px')]},
+            {'selector':'table','props':[('border-collapse','separate'),('border-spacing','0px'),('border-radius','10px')]}
+        ])
+        .set_caption(f"{report_type} Report - {head} <br> Date: {single_date.strftime('%d %b %Y')}")
+    )
+    dfi.export(styled, report_path, table_conversion="selenium")
+    caption = f"{report_type} Report for {head}\nDate: {single_date.strftime('%d %b %Y')}"
+    kit.sendwhats_image(number, report_path, caption)
+    time.sleep(25)
+
+# --- GUI ---
+def create_gui():
+    root = tk.Tk(); root.title("Spay WhatsApp Report Generator")
+
+    date_frame = ttk.LabelFrame(root,text="Select Report Dates"); date_frame.pack(padx=20,pady=10,fill="both",expand=True)
+    today=date.today(); first_day_cm=today.replace(day=1); last_day_lm=first_day_cm-timedelta(days=1); first_day_lm=last_day_lm.replace(day=1)
+
+    ttk.Label(date_frame,text="Select Date (FTD):").grid(row=0,column=0)
+    single_date_entry=DateEntry(date_frame,date_pattern='yyyy-mm-dd'); single_date_entry.set_date(today); single_date_entry.grid(row=0,column=1)
+    ttk.Label(date_frame,text="Current Month Start Date:").grid(row=1,column=0)
+    cur_month_start_entry=DateEntry(date_frame,date_pattern='yyyy-mm-dd'); cur_month_start_entry.set_date(first_day_cm); cur_month_start_entry.grid(row=1,column=1)
+    ttk.Label(date_frame,text="Current Month End Date:").grid(row=2,column=0)
+    cur_month_end_entry=DateEntry(date_frame,date_pattern='yyyy-mm-dd'); cur_month_end_entry.set_date(today); cur_month_end_entry.grid(row=2,column=1)
+    ttk.Label(date_frame,text="Last Month Start Date:").grid(row=3,column=0)
+    last_month_start_entry=DateEntry(date_frame,date_pattern='yyyy-mm-dd'); last_month_start_entry.set_date(first_day_lm); last_month_start_entry.grid(row=3,column=1)
+    ttk.Label(date_frame,text="Last Month End Date:").grid(row=4,column=0)
+    last_month_end_entry=DateEntry(date_frame,date_pattern='yyyy-mm-dd'); last_month_end_entry.set_date(last_day_lm); last_month_end_entry.grid(row=4,column=1)
+
+    log_frame=ttk.LabelFrame(root,text="Status Log"); log_frame.pack(padx=20,pady=10,fill="both",expand=True)
+    log_text=tk.Text(log_frame,height=10,width=80); log_text.pack(padx=5,pady=5,fill="both",expand=True)
+    def log_message(msg): log_text.insert(tk.END,msg+"\n"); log_text.see(tk.END); root.update_idletasks()
+
+    def generate_and_send(single_date,cur_month_start,cur_month_end,last_month_start,last_month_end):
+        log_message("🚀 Starting...")
+        asm_targets, asm_codes=get_asm_data()
+        if asm_targets.empty: log_message("❌ No ASM data"); return
+        data={}
+        for rtype in ["GTV","DMT"]:
+            data[rtype]={}
+            data[rtype]['single']=get_sql_data(single_date,single_date,report_type=rtype)
+            data[rtype]['cur']=get_sql_data(cur_month_start,cur_month_end,report_type=rtype)
+            data[rtype]['last']=get_sql_data(last_month_start,last_month_end,report_type=rtype)
+        reports={}
+        for rtype in ["GTV","DMT"]:
+            s1,u1=process_period_data(data[rtype]['single'],asm_codes,'Single')
+            s2,u2=process_period_data(data[rtype]['cur'],asm_codes,'Cur')
+            s3,u3=process_period_data(data[rtype]['last'],asm_codes,'Last')
+            df=asm_targets[['ASM','Head','City',f'Target_{rtype}']].copy()
+            df=df.merge(s1[['ASM','Count_Single']],on='ASM',how='left').merge(s2[['ASM','Count_Cur']],on='ASM',how='left').merge(s3[['ASM','Count_Last']],on='ASM',how='left')
+            df=df.merge(u1,on='ASM',how='left').merge(u2,on='ASM',how='left').merge(u3,on='ASM',how='left')
+            df['ACH%']=np.where(df[f'Target_{rtype}']>0,(df['Count_Cur']/df[f'Target_{rtype}'])*100,0)
+            df['LMTD %']=np.where(df['Count_Last']==0,0,(df['Count_Cur']/df['Count_Last'])*100)
+            rename_map={'ASM':'ASM Name','Count_Single':'FTD','Used_Code_Count_Single':'FTD ID','Count_Cur':f'{rtype} MTD','Used_Code_Count_Cur':'MTD ID','Count_Last':f'{rtype} LMTD','Used_Code_Count_Last':'LMTD ID'}
+            df=df.rename(columns=rename_map)
+            reports[rtype]=prepare_report_df(df)
+        image_folder="whatsapp_report_images"; os.makedirs(image_folder,exist_ok=True)
+        head_whatsapp=asm_targets[['Head','whatsapp_no']].drop_duplicates().set_index('Head')['whatsapp_no'].to_dict()
+        for head in reports["GTV"]['Head'].unique():
+            number=normalize_number(head_whatsapp.get(head,'')); 
+            if not number: log_message(f"❌ Skipping {head}: invalid number"); continue
+            log_message(f"📤 Sending reports to {head} ({number})")
+            send_report(reports["GTV"][reports["GTV"]['Head']==head],head,number,single_date,image_folder,"GTV")
+            send_report(reports["DMT"][reports["DMT"]['Head']==head],head,number,single_date,image_folder,"DMT")
+        shutil.rmtree(image_folder,ignore_errors=True)
+        messagebox.showinfo("Done","All reports sent")
+
+    def start_thread():
+        threading.Thread(
+            target=generate_and_send,
+            args=(single_date_entry.get_date(),cur_month_start_entry.get_date(),cur_month_end_entry.get_date(),last_month_start_entry.get_date(),last_month_end_entry.get_date()),
+            daemon=True
+        ).start()
+
+    generate_button=ttk.Button(root,text="🚀 Generate & Send WhatsApp Reports",command=start_thread)
+    generate_button.pack(padx=20,pady=10)
+    root.mainloop()
+
+# Run
+if __name__=="__main__":
+    create_gui()
